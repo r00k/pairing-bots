@@ -1,7 +1,15 @@
 import { resolve } from "node:path";
 import type { ThinkingLevel as AgentThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { KnownProvider } from "@mariozechner/pi-ai";
-import type { AgentId, EventStreamMode, PairAgentConfig, PauseStrategy, TurnPolicy, WorkspaceMode } from "./types.js";
+import type {
+	AgentId,
+	EventStreamMode,
+	ExecutionMode,
+	PairAgentConfig,
+	PauseStrategy,
+	TurnPolicy,
+	WorkspaceMode,
+} from "./types.js";
 
 export interface CliConfig {
 	task: string;
@@ -11,6 +19,7 @@ export interface CliConfig {
 	eventStreamMode: EventStreamMode;
 	workspaceMode: WorkspaceMode;
 	keepWorkspace: boolean;
+	compareStrategies: boolean;
 	pair: PairAgentConfig;
 }
 
@@ -52,6 +61,13 @@ function parseEventStreamMode(value: string): EventStreamMode {
 	throw new Error(`Invalid --event-stream-mode: ${value}`);
 }
 
+function parseExecutionMode(value: string): ExecutionMode {
+	if (value === "paired_turns" || value === "solo_driver_then_reviewer") {
+		return value;
+	}
+	throw new Error(`Invalid --execution-mode: ${value}`);
+}
+
 function defaultPauseStrategy(): PauseStrategy {
 	return {
 		mode: "every_n_file_edits",
@@ -89,6 +105,7 @@ export function defaultPairConfig(cwd: string): PairAgentConfig {
 		cwd,
 		maxRounds: 8,
 		driverStartsAs: "A",
+		executionMode: "paired_turns",
 		pauseStrategy: defaultPauseStrategy(),
 		turnPolicy: defaultTurnPolicy(),
 		modelA: {
@@ -115,6 +132,7 @@ export function helpText(): string {
 		"  --cwd <path>",
 		"  --max-rounds <n>",
 		"  --driver-start A|B",
+		"  --execution-mode paired_turns|solo_driver_then_reviewer",
 		"  --turn-policy alternate_each_round|same_driver_until_navigator_signoff",
 		"  --max-consecutive-rounds <n>",
 		"  --max-consecutive-checkpoints <n>",
@@ -132,6 +150,7 @@ export function helpText(): string {
 		"  --event-stream-mode compact|full",
 		"  --workspace-mode direct|ephemeral_copy",
 		"  --keep-workspace",
+		"  --compare-strategies",
 		"  --help",
 	].join("\n");
 }
@@ -145,6 +164,7 @@ export function parseCli(argv: string[], processCwd = process.cwd()): CliConfig 
 	let eventStreamMode: EventStreamMode = "compact";
 	let workspaceMode: WorkspaceMode = "direct";
 	let keepWorkspace = false;
+	let compareStrategies = false;
 
 	for (let i = 0; i < argv.length; i += 1) {
 		const arg = argv[i];
@@ -157,6 +177,10 @@ export function parseCli(argv: string[], processCwd = process.cwd()): CliConfig 
 		}
 		if (arg === "--keep-workspace") {
 			keepWorkspace = true;
+			continue;
+		}
+		if (arg === "--compare-strategies") {
+			compareStrategies = true;
 			continue;
 		}
 		if (!arg.startsWith("--")) {
@@ -181,6 +205,10 @@ export function parseCli(argv: string[], processCwd = process.cwd()): CliConfig 
 				break;
 			case "--driver-start":
 				pair.driverStartsAs = parseAgentId(next);
+				i += 1;
+				break;
+			case "--execution-mode":
+				pair.executionMode = parseExecutionMode(next);
 				i += 1;
 				break;
 			case "--turn-policy":
@@ -305,6 +333,7 @@ export function parseCli(argv: string[], processCwd = process.cwd()): CliConfig 
 		eventStreamMode,
 		workspaceMode,
 		keepWorkspace,
+		compareStrategies,
 		...(outputPath ? { outputPath } : {}),
 		...(logFile ? { logFile } : {}),
 		...(eventLogFile ? { eventLogFile } : {}),

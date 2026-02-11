@@ -6,6 +6,7 @@ export type {
 	DriverDecision,
 	DriverReport,
 	EventStreamMode,
+	ExecutionMode,
 	FinalReview,
 	ModelSpec,
 	NavigatorReview,

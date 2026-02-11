@@ -5,6 +5,7 @@ export type AgentId = "A" | "B";
 export type PairRole = "driver" | "navigator";
 export type WorkspaceMode = "direct" | "ephemeral_copy";
 export type EventStreamMode = "compact" | "full";
+export type ExecutionMode = "paired_turns" | "solo_driver_then_reviewer";
 
 export interface ModelSpec {
 	provider: KnownProvider;
@@ -38,6 +39,7 @@ export interface PairAgentConfig {
 	cwd: string;
 	maxRounds: number;
 	driverStartsAs: AgentId;
+	executionMode: ExecutionMode;
 	pauseStrategy: PauseStrategy;
 	turnPolicy: TurnPolicy;
 }

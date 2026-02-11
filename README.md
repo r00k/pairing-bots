@@ -17,6 +17,7 @@ Single-agent coding can move fast, but it can also miss mistakes when reasoning 
 - Model A: `anthropic/claude-opus-4-6` (`high`)
 - Model B: `openai/gpt-5.2-codex` (`high`)
 - Turn policy: `same_driver_until_navigator_signoff`
+- Execution mode: `paired_turns`
 - Safety cap: force swap after `3` consecutive rounds or `4` consecutive checkpoints
 - Pause policy: checkpoint every `3` successful `edit`/`write` tool calls
 
@@ -33,6 +34,9 @@ Single-agent coding can move fast, but it can also miss mistakes when reasoning 
   - driver has coding tools
   - navigator has read-only tools
 - Configurable turn policy and checkpointing
+- Configurable execution strategy:
+  - `paired_turns`: alternating/guardrailed driver-navigator rounds
+  - `solo_driver_then_reviewer`: A plans, A implements, B reviews final output, A optionally integrates feedback
 - Driver accountability flow:
   - navigator can provide actionable feedback or `NONE`
   - driver must `accept` / `partial` / `reject` feedback with justification
@@ -102,8 +106,10 @@ npm run start -- --task "Implement feature X with tests"
 
 1. Load config + credentials.
 2. Create model workers A and B.
-3. Run read-only planning handshake (A draft -> B critique -> A revise).
-4. Enter implementation rounds:
+3. Plan phase:
+   - `paired_turns`: A draft -> B critique -> A revise
+   - `solo_driver_then_reviewer`: A produces final plan directly
+4. Implementation:
    - one model is driver, one is navigator
    - driver implements a chunk
    - automatic checkpoint pauses trigger after configured edit/write cadence
@@ -112,8 +118,9 @@ npm run start -- --task "Implement feature X with tests"
 5. Repeat rounds until:
    - driver says `done` and navigator has no feedback, or
    - max rounds reached.
-6. Run final review with both models.
-7. Produce joint verdict (`APPROVED` or `NEEDS_MORE_WORK`) and summary metrics.
+6. Finalization:
+   - `paired_turns`: run final review with both models and synthesize joint verdict
+   - `solo_driver_then_reviewer`: stop after B review and optional A integration (verdict synthesized from that cycle)
 
 ## Domain concepts
 
@@ -158,6 +165,7 @@ Optional:
 - `--cwd <path>`
 - `--max-rounds <n>`
 - `--driver-start A|B`
+- `--execution-mode paired_turns|solo_driver_then_reviewer`
 - `--turn-policy alternate_each_round|same_driver_until_navigator_signoff`
 - `--max-consecutive-rounds <n>`
 - `--max-consecutive-checkpoints <n>`
@@ -175,6 +183,7 @@ Optional:
 - `--event-stream-mode compact|full`
 - `--workspace-mode direct|ephemeral_copy`
 - `--keep-workspace`
+- `--compare-strategies`
 - `--help`
 
 ## Example: fully configured run
@@ -185,6 +194,7 @@ npm run start -- \
   --cwd /absolute/path/to/repo \
   --max-rounds 8 \
   --driver-start A \
+  --execution-mode paired_turns \
   --turn-policy same_driver_until_navigator_signoff \
   --max-consecutive-rounds 3 \
   --max-consecutive-checkpoints 4 \
@@ -201,6 +211,16 @@ npm run start -- \
   --event-stream-mode compact \
   --output /tmp/pair-run.json
 ```
+
+## Strategy Comparison Mode
+
+Use `--compare-strategies` to run both approaches on isolated workspaces from the same baseline:
+- `paired_turns`
+- `solo_driver_then_reviewer`
+
+When `--output` is set, the CLI writes:
+- comparison report at the exact `--output` path
+- per-strategy run artifacts with suffixed names (for example `run.paired_turns.json` and `run.solo_driver_then_reviewer.json`)
 
 ## Summary metrics explained
 

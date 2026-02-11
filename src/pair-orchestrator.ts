@@ -9,6 +9,9 @@ import {
 	buildPlanCritiquePrompt,
 	buildPlanDraftPrompt,
 	buildPlanRevisionPrompt,
+	buildSoloDriverTurnPrompt,
+	buildSoloNavigatorReviewPrompt,
+	buildSoloPlanPrompt,
 	describePauseStrategy,
 	describeTurnPolicy,
 } from "./prompts.js";
@@ -22,6 +25,7 @@ import type {
 	FinalReview,
 	PairAgentConfig,
 	PairRunResult,
+	PauseStrategy,
 	RoundResult,
 	RunSummary,
 	SharedEntry,
@@ -72,6 +76,97 @@ function contributionTemplate(agent: AgentId): ContributionSummary {
 
 function roundPercent(value: number): number {
 	return Math.round(value * 10) / 10;
+}
+
+interface DriverExecutionTracker {
+	onEvent: (event: AgentEvent) => void;
+	setPhase: (phase: "driving" | "feedback_resolution") => void;
+	snapshot: () => {
+		pauseTriggered: boolean;
+		checkpointCount: number;
+		editWriteCallCount: number;
+		estimatedWrittenBytes: number;
+	};
+}
+
+function createDriverExecutionTracker(params: {
+	pauseStrategy: PauseStrategy;
+	onCheckpoint?: (phase: "driving" | "feedback_resolution") => void;
+}): DriverExecutionTracker {
+	let pauseTriggered = false;
+	let countedEdits = 0;
+	let nextCheckpointAt = params.pauseStrategy.mode === "every_n_file_edits" ? params.pauseStrategy.editsPerPause : Infinity;
+	let checkpointCount = 0;
+	let editWriteCallCount = 0;
+	let estimatedWrittenBytes = 0;
+	const pendingWriteEstimates = new Map<string, number>();
+	let currentPhase: "driving" | "feedback_resolution" = "driving";
+
+	const onEvent = (event: AgentEvent): void => {
+		if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write")) {
+			pendingWriteEstimates.set(event.toolCallId, estimateWrittenBytes(event.toolName, event.args));
+			return;
+		}
+
+		if (params.pauseStrategy.mode !== "every_n_file_edits") {
+			if (event.type === "tool_execution_end" && !event.isError && (event.toolName === "edit" || event.toolName === "write")) {
+				editWriteCallCount += 1;
+				estimatedWrittenBytes += pendingWriteEstimates.get(event.toolCallId) ?? 0;
+				pendingWriteEstimates.delete(event.toolCallId);
+			}
+			return;
+		}
+
+		if (event.type !== "tool_execution_end") {
+			return;
+		}
+
+		if (event.toolName === "edit" || event.toolName === "write") {
+			if (!event.isError) {
+				editWriteCallCount += 1;
+				estimatedWrittenBytes += pendingWriteEstimates.get(event.toolCallId) ?? 0;
+			}
+			pendingWriteEstimates.delete(event.toolCallId);
+		}
+
+		if (event.isError) {
+			return;
+		}
+		if (!params.pauseStrategy.countedTools.includes(event.toolName)) {
+			return;
+		}
+
+		countedEdits += 1;
+		if (countedEdits < nextCheckpointAt) {
+			return;
+		}
+
+		pauseTriggered = true;
+		checkpointCount += 1;
+		nextCheckpointAt += params.pauseStrategy.editsPerPause;
+		params.onCheckpoint?.(currentPhase);
+	};
+
+	return {
+		onEvent,
+		setPhase: (phase) => {
+			currentPhase = phase;
+		},
+		snapshot: () => ({
+			pauseTriggered,
+			checkpointCount,
+			editWriteCallCount,
+			estimatedWrittenBytes,
+		}),
+	};
+}
+
+interface ExecutionResult {
+	rounds: RoundResult[];
+	checkpointCount: number;
+	swapCount: number;
+	contributions: Record<AgentId, ContributionSummary>;
+	finalReview?: FinalReview;
 }
 
 export class PairProgrammingOrchestrator {
@@ -178,6 +273,56 @@ export class PairProgrammingOrchestrator {
 		return agreedPlan;
 	}
 
+	private async soloPlanning(task: string): Promise<string> {
+		this.workers.A.setRole("navigator");
+		this.workers.B.setRole("navigator");
+
+		const aPlanRaw = await this.runPromptWithObservability({
+			actor: "A",
+			prompt: buildSoloPlanPrompt(task),
+			promptKind: "plan_solo",
+			phase: "planning",
+		});
+		const agreedPlan = aPlanRaw.trim();
+		this.broadcastShared("plan_agreed", "A", agreedPlan);
+		return agreedPlan;
+	}
+
+	private synthesizeSoloFinalReview(round: RoundResult): FinalReview {
+		const reviewA = parseNavigatorReview(
+			[
+				"<private_reflection>Skipped extra final review in solo mode.</private_reflection>",
+				round.driverDecision
+					? `<public_feedback>Driver decision: ${round.driverDecision.decision}. ${round.driverDecision.justification}</public_feedback>`
+					: "<public_feedback>NONE</public_feedback>",
+				"<driver_recommendation>continue</driver_recommendation>",
+			].join("\n"),
+		);
+		const reviewB = round.navigatorReview;
+		const accepted = round.driverDecision?.decision === "accept";
+		const jointVerdict = !reviewB.hasFeedback || accepted ? "APPROVED" : "NEEDS_MORE_WORK";
+		const rationale =
+			jointVerdict === "APPROVED"
+				? "Solo mode completed after B's final review and A's integration decision."
+				: "B provided final feedback and A did not fully accept it in solo mode.";
+		const nextSteps = jointVerdict === "APPROVED" ? "NONE" : reviewB.publicFeedback;
+
+		this.broadcastShared(
+			"joint_verdict",
+			"system",
+			`Verdict: ${jointVerdict}\nRationale: ${rationale}\nNext steps: ${nextSteps}`,
+		);
+
+		return {
+			reviewA,
+			reviewB,
+			jointVerdict,
+			rationale,
+			nextSteps,
+			raw: "synthetic_solo_final_review",
+		};
+	}
+
 	private async runRound(task: string, agreedPlan: string, round: number, driverId: AgentId): Promise<RoundResult> {
 		const navigatorId = otherAgent(driverId);
 		const driver = this.workers[driverId];
@@ -198,59 +343,16 @@ export class PairProgrammingOrchestrator {
 			turnPolicyDescription,
 		});
 
-		let pauseTriggered = false;
-		let countedEdits = 0;
-		let nextCheckpointAt = this.config.pauseStrategy.mode === "every_n_file_edits" ? this.config.pauseStrategy.editsPerPause : Infinity;
-		let checkpointCount = 0;
-		let editWriteCallCount = 0;
-		let estimatedWrittenBytes = 0;
-		const pendingWriteEstimates = new Map<string, number>();
-		let currentDriverPhase: "driving" | "feedback_resolution" = "driving";
-
-		const onDriverEvent = (event: AgentEvent): void => {
-			if (event.type === "tool_execution_start" && (event.toolName === "edit" || event.toolName === "write")) {
-				pendingWriteEstimates.set(event.toolCallId, estimateWrittenBytes(event.toolName, event.args));
-				return;
-			}
-
-			if (this.config.pauseStrategy.mode !== "every_n_file_edits") {
-				if (event.type === "tool_execution_end" && !event.isError && (event.toolName === "edit" || event.toolName === "write")) {
-					editWriteCallCount += 1;
-					estimatedWrittenBytes += pendingWriteEstimates.get(event.toolCallId) ?? 0;
-					pendingWriteEstimates.delete(event.toolCallId);
-				}
-				return;
-			}
-			if (event.type !== "tool_execution_end") {
-				return;
-			}
-			if (event.toolName === "edit" || event.toolName === "write") {
-				if (!event.isError) {
-					editWriteCallCount += 1;
-					estimatedWrittenBytes += pendingWriteEstimates.get(event.toolCallId) ?? 0;
-				}
-				pendingWriteEstimates.delete(event.toolCallId);
-			}
-			if (event.isError) {
-				return;
-			}
-			if (!this.config.pauseStrategy.countedTools.includes(event.toolName)) {
-				return;
-			}
-			countedEdits += 1;
-			if (countedEdits < nextCheckpointAt) {
-				return;
-			}
-
-			pauseTriggered = true;
-			checkpointCount += 1;
-			nextCheckpointAt += this.config.pauseStrategy.editsPerPause;
-			driver.agent.steer({
-				role: "user",
-				content: [{ type: "text", text: buildPauseInterruptionPrompt(navigatorId, currentDriverPhase) }],
-				timestamp: Date.now(),
-			});
-		};
+		const executionTracker = createDriverExecutionTracker({
+			pauseStrategy: this.config.pauseStrategy,
+			onCheckpoint: (phase) => {
+				driver.agent.steer({
+					role: "user",
+					content: [{ type: "text", text: buildPauseInterruptionPrompt(navigatorId, phase) }],
+					timestamp: Date.now(),
+				});
+			},
+		});
 
 		const driverReportRaw = await this.runPromptWithObservability({
 			actor: driverId,
@@ -258,7 +360,7 @@ export class PairProgrammingOrchestrator {
 			promptKind: "driver_turn",
 			phase: "driving",
 			round,
-			onEvent: onDriverEvent,
+			onEvent: executionTracker.onEvent,
 		});
 		const driverReport = parseDriverReport(driverReportRaw);
 		this.broadcastShared(
@@ -272,6 +374,7 @@ export class PairProgrammingOrchestrator {
 				`Navigator questions: ${driverReport.questionsForNavigator}`,
 			].join("\n"),
 		);
+		const drivingStats = executionTracker.snapshot();
 
 		const navigatorReviewRaw = await this.runPromptWithObservability({
 			actor: navigatorId,
@@ -281,7 +384,7 @@ export class PairProgrammingOrchestrator {
 				round,
 				driver: driverId,
 				driverReport: driverReport.raw,
-				pauseTriggered,
+				pauseTriggered: drivingStats.pauseTriggered,
 				turnPolicyDescription,
 			}),
 			promptKind: "navigator_review",
@@ -300,14 +403,14 @@ export class PairProgrammingOrchestrator {
 
 		let driverDecision: DriverDecision | undefined;
 		if (navigatorReview.hasFeedback) {
-			currentDriverPhase = "feedback_resolution";
+			executionTracker.setPhase("feedback_resolution");
 			const driverDecisionRaw = await this.runPromptWithObservability({
 				actor: driverId,
 				prompt: buildDriverDecisionPrompt(navigatorReview.publicFeedback),
 				promptKind: "driver_decision",
 				phase: "feedback_resolution",
 				round,
-				onEvent: onDriverEvent,
+				onEvent: executionTracker.onEvent,
 			});
 			driverDecision = parseDriverDecision(driverDecisionRaw);
 			this.broadcastShared(
@@ -317,14 +420,16 @@ export class PairProgrammingOrchestrator {
 			);
 		}
 
+		const executionStats = executionTracker.snapshot();
+
 		return {
 			round,
 			driver: driverId,
 			navigator: navigatorId,
-			pauseTriggered,
-			checkpointCount,
-			editWriteCallCount,
-			estimatedWrittenBytes,
+			pauseTriggered: executionStats.pauseTriggered,
+			checkpointCount: executionStats.checkpointCount,
+			editWriteCallCount: executionStats.editWriteCallCount,
+			estimatedWrittenBytes: executionStats.estimatedWrittenBytes,
 			driverReport,
 			navigatorReview,
 			...(driverDecision ? { driverDecision } : {}),
@@ -359,6 +464,236 @@ export class PairProgrammingOrchestrator {
 		}
 
 		return { swap: false, reason: "continue_same_driver" };
+	}
+
+	private async runPairedExecution(task: string, agreedPlan: string): Promise<ExecutionResult> {
+		const rounds: RoundResult[] = [];
+		let driverId = this.config.driverStartsAs;
+		let consecutiveRoundsWithDriver = 0;
+		let consecutiveCheckpointsWithDriver = 0;
+		let swapCount = 0;
+		let checkpointCount = 0;
+		const contributions: Record<AgentId, ContributionSummary> = {
+			A: contributionTemplate("A"),
+			B: contributionTemplate("B"),
+		};
+
+		for (let round = 1; round <= this.config.maxRounds; round += 1) {
+			this.observer?.record({
+				category: "orchestrator",
+				name: "round_start",
+				actor: "system",
+				round,
+				details: { driver: driverId, navigator: otherAgent(driverId) },
+			});
+
+			const result = await this.runRound(task, agreedPlan, round, driverId);
+			rounds.push(result);
+			checkpointCount += result.checkpointCount;
+			consecutiveRoundsWithDriver += 1;
+			consecutiveCheckpointsWithDriver += result.checkpointCount;
+			contributions[driverId].roundsDriven += 1;
+			contributions[driverId].checkpointsWhileDriving += result.checkpointCount;
+			contributions[driverId].editWriteCallCount += result.editWriteCallCount;
+			contributions[driverId].estimatedWrittenBytes += result.estimatedWrittenBytes;
+
+			this.observer?.record({
+				category: "orchestrator",
+				name: "round_end",
+				actor: "system",
+				round,
+				details: {
+					driverStatus: result.driverReport.status,
+					navigatorHasFeedback: result.navigatorReview.hasFeedback,
+					navigatorRecommendation: result.navigatorReview.driverRecommendation,
+					checkpointCount: result.checkpointCount,
+					editWriteCallCount: result.editWriteCallCount,
+				},
+			});
+
+			const shouldStop = result.driverReport.status === "done" && !result.navigatorReview.hasFeedback;
+			if (shouldStop) {
+				this.broadcastShared("loop_stop", "system", `Stopped at round ${round} because driver signaled done and navigator had no feedback.`);
+				break;
+			}
+
+			if (round === this.config.maxRounds) {
+				this.broadcastShared("loop_stop", "system", `Reached max rounds (${this.config.maxRounds}).`);
+				break;
+			}
+
+			const swapDecision = this.shouldSwapDriver(result, consecutiveRoundsWithDriver, consecutiveCheckpointsWithDriver);
+			if (swapDecision.swap) {
+				const previousDriver = driverId;
+				driverId = otherAgent(driverId);
+				swapCount += 1;
+				consecutiveRoundsWithDriver = 0;
+				consecutiveCheckpointsWithDriver = 0;
+				this.broadcastShared(
+					"driver_swap",
+					"system",
+					`Swapped driver from ${previousDriver} to ${driverId}. Reason: ${swapDecision.reason}.`,
+				);
+				this.observer?.record({
+					category: "orchestrator",
+					name: "driver_swap",
+					actor: "system",
+					round,
+					details: { from: previousDriver, to: driverId, reason: swapDecision.reason },
+				});
+			}
+		}
+
+		return {
+			rounds,
+			checkpointCount,
+			swapCount,
+			contributions,
+		};
+	}
+
+	private async runSoloDriverThenReviewerExecution(task: string, agreedPlan: string): Promise<ExecutionResult> {
+		const round = 1;
+		const driverId: AgentId = "A";
+		const reviewerId: AgentId = "B";
+		const driver = this.workers[driverId];
+		const reviewer = this.workers[reviewerId];
+
+		driver.setRole("driver");
+		reviewer.setRole("navigator");
+
+		this.observer?.record({
+			category: "orchestrator",
+			name: "round_start",
+			actor: "system",
+			round,
+			details: { driver: driverId, navigator: reviewerId, mode: "solo_driver_then_reviewer" },
+		});
+
+		const executionTracker = createDriverExecutionTracker({
+			pauseStrategy: this.config.pauseStrategy,
+		});
+
+		const driverReportRaw = await this.runPromptWithObservability({
+			actor: driverId,
+			prompt: buildSoloDriverTurnPrompt({
+				task,
+				agreedPlan,
+				driver: driverId,
+				reviewer: reviewerId,
+				pauseDescription: describePauseStrategy(this.config.pauseStrategy),
+			}),
+			promptKind: "driver_turn_solo",
+			phase: "driving",
+			round,
+			onEvent: executionTracker.onEvent,
+		});
+		const driverReport = parseDriverReport(driverReportRaw);
+		this.broadcastShared(
+			"driver_report",
+			driverId,
+			[
+				`Round ${round}`,
+				`Status: ${driverReport.status}`,
+				`Summary: ${driverReport.summary}`,
+				`Changes: ${driverReport.changes}`,
+				`Navigator questions: ${driverReport.questionsForNavigator}`,
+			].join("\n"),
+		);
+
+		const drivingStats = executionTracker.snapshot();
+		const navigatorReviewRaw = await this.runPromptWithObservability({
+			actor: reviewerId,
+			prompt: buildSoloNavigatorReviewPrompt({
+				task,
+				agreedPlan,
+				driver: driverId,
+				reviewer: reviewerId,
+				driverReport: driverReport.raw,
+				checkpointCount: drivingStats.checkpointCount,
+			}),
+			promptKind: "navigator_review_solo",
+			phase: "navigation",
+			round,
+		});
+		const navigatorReview = parseNavigatorReview(navigatorReviewRaw);
+		reviewer.appendPrivateMemory(navigatorReview.privateReflection);
+
+		if (navigatorReview.hasFeedback) {
+			this.broadcastShared("navigator_feedback", reviewerId, navigatorReview.publicFeedback);
+		} else {
+			this.broadcastShared("navigator_feedback", reviewerId, "NONE");
+		}
+		this.broadcastShared("navigator_handoff_signal", reviewerId, navigatorReview.driverRecommendation);
+
+		let driverDecision: DriverDecision | undefined;
+		if (navigatorReview.hasFeedback) {
+			executionTracker.setPhase("feedback_resolution");
+			const driverDecisionRaw = await this.runPromptWithObservability({
+				actor: driverId,
+				prompt: buildDriverDecisionPrompt(navigatorReview.publicFeedback),
+				promptKind: "driver_decision",
+				phase: "feedback_resolution",
+				round,
+				onEvent: executionTracker.onEvent,
+			});
+			driverDecision = parseDriverDecision(driverDecisionRaw);
+			this.broadcastShared(
+				"driver_decision",
+				driverId,
+				`Decision: ${driverDecision.decision}\nJustification: ${driverDecision.justification}`,
+			);
+		}
+
+		const executionStats = executionTracker.snapshot();
+		const roundResult: RoundResult = {
+			round,
+			driver: driverId,
+			navigator: reviewerId,
+			pauseTriggered: executionStats.pauseTriggered,
+			checkpointCount: executionStats.checkpointCount,
+			editWriteCallCount: executionStats.editWriteCallCount,
+			estimatedWrittenBytes: executionStats.estimatedWrittenBytes,
+			driverReport,
+			navigatorReview,
+			...(driverDecision ? { driverDecision } : {}),
+		};
+
+		this.observer?.record({
+			category: "orchestrator",
+			name: "round_end",
+			actor: "system",
+			round,
+			details: {
+				driverStatus: roundResult.driverReport.status,
+				navigatorHasFeedback: roundResult.navigatorReview.hasFeedback,
+				navigatorRecommendation: roundResult.navigatorReview.driverRecommendation,
+				checkpointCount: roundResult.checkpointCount,
+				editWriteCallCount: roundResult.editWriteCallCount,
+			},
+		});
+		this.broadcastShared(
+			"loop_stop",
+			"system",
+			"Stopped after solo driver pass plus reviewer feedback/integration cycle.",
+		);
+
+		const contributions: Record<AgentId, ContributionSummary> = {
+			A: contributionTemplate("A"),
+			B: contributionTemplate("B"),
+		};
+		contributions[driverId].roundsDriven = 1;
+		contributions[driverId].checkpointsWhileDriving = roundResult.checkpointCount;
+		contributions[driverId].editWriteCallCount = roundResult.editWriteCallCount;
+		contributions[driverId].estimatedWrittenBytes = roundResult.estimatedWrittenBytes;
+
+		return {
+			rounds: [roundResult],
+			checkpointCount: roundResult.checkpointCount,
+			swapCount: 0,
+			contributions,
+			finalReview: this.synthesizeSoloFinalReview(roundResult),
+		};
 	}
 
 	private buildSummary(
@@ -461,96 +796,27 @@ export class PairProgrammingOrchestrator {
 				details: {
 					taskLength: task.length,
 					maxRounds: this.config.maxRounds,
+					executionMode: this.config.executionMode,
 					turnPolicy: this.config.turnPolicy.mode,
 					pausePolicy: this.config.pauseStrategy.mode,
 				},
 			});
 			this.broadcastShared("task", "system", task);
 
-			const agreedPlan = await this.collaborativePlanning(task);
-			const rounds: RoundResult[] = [];
-			let driverId = this.config.driverStartsAs;
-			let consecutiveRoundsWithDriver = 0;
-			let consecutiveCheckpointsWithDriver = 0;
-			let swapCount = 0;
-			let checkpointCount = 0;
-			const contributions: Record<AgentId, ContributionSummary> = {
-				A: contributionTemplate("A"),
-				B: contributionTemplate("B"),
-			};
-
-			for (let round = 1; round <= this.config.maxRounds; round += 1) {
-				this.observer?.record({
-					category: "orchestrator",
-					name: "round_start",
-					actor: "system",
-					round,
-					details: { driver: driverId, navigator: otherAgent(driverId) },
-				});
-
-				const result = await this.runRound(task, agreedPlan, round, driverId);
-				rounds.push(result);
-				checkpointCount += result.checkpointCount;
-				consecutiveRoundsWithDriver += 1;
-				consecutiveCheckpointsWithDriver += result.checkpointCount;
-				contributions[driverId].roundsDriven += 1;
-				contributions[driverId].checkpointsWhileDriving += result.checkpointCount;
-				contributions[driverId].editWriteCallCount += result.editWriteCallCount;
-				contributions[driverId].estimatedWrittenBytes += result.estimatedWrittenBytes;
-
-				this.observer?.record({
-					category: "orchestrator",
-					name: "round_end",
-					actor: "system",
-					round,
-					details: {
-						driverStatus: result.driverReport.status,
-						navigatorHasFeedback: result.navigatorReview.hasFeedback,
-						navigatorRecommendation: result.navigatorReview.driverRecommendation,
-						checkpointCount: result.checkpointCount,
-						editWriteCallCount: result.editWriteCallCount,
-					},
-				});
-
-				const shouldStop = result.driverReport.status === "done" && !result.navigatorReview.hasFeedback;
-				if (shouldStop) {
-					this.broadcastShared("loop_stop", "system", `Stopped at round ${round} because driver signaled done and navigator had no feedback.`);
-					break;
-				}
-
-				if (round === this.config.maxRounds) {
-					this.broadcastShared("loop_stop", "system", `Reached max rounds (${this.config.maxRounds}).`);
-					break;
-				}
-
-				const swapDecision = this.shouldSwapDriver(result, consecutiveRoundsWithDriver, consecutiveCheckpointsWithDriver);
-				if (swapDecision.swap) {
-					const previousDriver = driverId;
-					driverId = otherAgent(driverId);
-					swapCount += 1;
-					consecutiveRoundsWithDriver = 0;
-					consecutiveCheckpointsWithDriver = 0;
-					this.broadcastShared(
-						"driver_swap",
-						"system",
-						`Swapped driver from ${previousDriver} to ${driverId}. Reason: ${swapDecision.reason}.`,
-					);
-					this.observer?.record({
-						category: "orchestrator",
-						name: "driver_swap",
-						actor: "system",
-						round,
-						details: { from: previousDriver, to: driverId, reason: swapDecision.reason },
-					});
-				}
-			}
-
-			const finalReview = await this.finalReview(task, agreedPlan);
-			const summary = this.buildSummary(contributions, checkpointCount, swapCount);
+			const agreedPlan =
+				this.config.executionMode === "solo_driver_then_reviewer"
+					? await this.soloPlanning(task)
+					: await this.collaborativePlanning(task);
+			const execution =
+				this.config.executionMode === "solo_driver_then_reviewer"
+					? await this.runSoloDriverThenReviewerExecution(task, agreedPlan)
+					: await this.runPairedExecution(task, agreedPlan);
+			const finalReview = execution.finalReview ?? (await this.finalReview(task, agreedPlan));
+			const summary = this.buildSummary(execution.contributions, execution.checkpointCount, execution.swapCount);
 			resultCore = {
 				task,
 				agreedPlan,
-				rounds,
+				rounds: execution.rounds,
 				finalReview,
 				summary,
 				sharedJournal: [...this.sharedJournal],

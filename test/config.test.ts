@@ -22,17 +22,28 @@ describe("parseCli", () => {
 		const parsed = parseCli([
 			"--task",
 			"x",
+			"--execution-mode",
+			"solo_driver_then_reviewer",
 			"--event-stream-mode",
 			"full",
 			"--workspace-mode",
 			"ephemeral_copy",
 			"--keep-workspace",
+			"--compare-strategies",
 			"--event-log-file",
 			"logs/events.jsonl",
 		]);
+		expect(parsed.pair.executionMode).toBe("solo_driver_then_reviewer");
 		expect(parsed.eventStreamMode).toBe("full");
 		expect(parsed.workspaceMode).toBe("ephemeral_copy");
 		expect(parsed.keepWorkspace).toBe(true);
+		expect(parsed.compareStrategies).toBe(true);
 		expect(parsed.eventLogFile).toBe(resolve("logs/events.jsonl"));
+	});
+
+	it("defaults to paired execution mode and compare disabled", () => {
+		const parsed = parseCli(["--task", "x"]);
+		expect(parsed.pair.executionMode).toBe("paired_turns");
+		expect(parsed.compareStrategies).toBe(false);
 	});
 });

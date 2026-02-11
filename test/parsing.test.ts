@@ -38,6 +38,16 @@ describe("parsing", () => {
 		expect(parsed.driverRecommendation).toBe("continue");
 	});
 
+	it("treats NONE feedback with punctuation as no feedback", () => {
+		const parsed = parseNavigatorReview(`
+<private_reflection>Looks stable.</private_reflection>
+<public_feedback>NONE.</public_feedback>
+`);
+
+		expect(parsed.hasFeedback).toBe(false);
+		expect(parsed.driverRecommendation).toBe("continue");
+	});
+
 	it("parses joint verdict", () => {
 		const parsed = parseJointVerdict(`
 <joint_verdict>APPROVED</joint_verdict>

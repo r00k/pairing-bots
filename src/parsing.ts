@@ -25,7 +25,8 @@ export function parseDriverReport(raw: string): DriverReport {
 export function parseNavigatorReview(raw: string): NavigatorReview {
 	const privateReflection = extractTag(raw, "private_reflection") ?? "(no private reflection provided)";
 	const publicFeedback = extractTag(raw, "public_feedback") ?? "NONE";
-	const hasFeedback = publicFeedback.trim().toUpperCase() !== "NONE";
+	const normalizedFeedback = publicFeedback.trim().toUpperCase().replace(/[.!]+$/, "");
+	const hasFeedback = normalizedFeedback !== "NONE";
 	const recommendationRaw = extractTag(raw, "driver_recommendation")?.toLowerCase();
 	const driverRecommendation = recommendationRaw === "handoff" ? "handoff" : "continue";
 
